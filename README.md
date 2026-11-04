@@ -2,7 +2,7 @@
 
 Kitty is a small phone-friendly web app that saves **Internet Archive audio** onto your iPhone. Paste an `archive.org` link, tap **Download**, then tap **Save audio**. You get the original file. Kitty does not re-encode it.
 
-Kitty will only fetch `https://archive.org` or `https://www.archive.org` links under `/details/` or `/download/`. Other sites, lookalike hosts, username tricks, and other ports are refused on the server before yt-dlp runs. yt-dlp is also limited to its `archive.org` extractor.
+Kitty will only fetch `https://archive.org` or `https://www.archive.org` links under `/details/` or `/download/`. Other sites, lookalike hosts, username tricks, and other ports are refused on the server before yt-dlp runs. yt-dlp is also limited to its `archive.org` extractor. Page fetches, redirects, and the audio file itself stay on `archive.org`, `www.archive.org`, or the storage hosts `*.us.archive.org` and `*.ca.archive.org` (where `/download/` files are redirected). A redirect to any other host, including localhost, is refused, and the connection uses the address that was checked.
 
 The hosting cost is **$0**. [Streamlit Community Cloud](https://streamlit.io/cloud) runs the app for free, and Kitty does not use paid APIs or accounts.
 
@@ -22,6 +22,7 @@ Open the URL Streamlit prints (usually `http://localhost:8501`). On your phone, 
 Run the tests:
 
 ```bash
+pip install -r requirements-dev.txt
 pytest
 ```
 
@@ -57,4 +58,4 @@ Pushing to `main` updates the deployed app. There is nothing to pay for.
 
 Open Kitty from the new icon. Paste a link such as `https://archive.org/details/…` or `https://archive.org/download/…/file.mp3`, tap **Download**, then tap **Save audio**. iOS saves the original file (for example `.mp3` or `.flac`) through the share sheet or the Files app. Use Safari if another browser does not offer Add to Home Screen.
 
-Very large items can run out of memory on the free Cloud plan. A single track or a direct file link is the comfortable size.
+Kitty keeps each file on disk and caps a download at 80 MiB per file and 100 MiB overall, so a multi-file item cannot fill the free Cloud plan. A bare details page saves one file. A `/download/<id>/<file>` link saves that file. A single track or a direct file link is the comfortable size.

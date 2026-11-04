@@ -11,10 +11,14 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Callable
+from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 import yt_dlp
+from yt_dlp.networking.exceptions import RequestError
 from yt_dlp.utils import DownloadError
+
+from pinned_http import PinnedArchiveRH
 
 ALLOWED_HOSTS = frozenset({"archive.org", "www.archive.org"})
 ALLOWED_PREFIXES = frozenset({"details", "download"})
@@ -33,6 +37,10 @@ _HINT = (
     "Use an https://archive.org or https://www.archive.org link "
     "under /details/ or /download/."
 )
+# Phone-sized caps so one item cannot fill Streamlit Cloud's memory or disk.
+MAX_FILE_BYTES = 80 * 1024 * 1024
+MAX_TOTAL_BYTES = 100 * 1024 * 1024
+_PARTIAL_SUFFIXES = {".part", ".ytdl", ".temp"}
 
 
 class ArchiveUrlError(ValueError):
@@ -193,6 +201,142 @@ def _to_details_url(canonical: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, ""))
 
 
+def install_pinned_handler(ydl) -> None:
+    """Replace yt-dlp's HTTP stack with the pinned archive.org handler."""
+    build = getattr(ydl, "build_request_director", None)
+    if build is None or getattr(ydl, "_kitty_pinned", False):
+        return
+
+    def build_pinned(handlers, preferences=None):
+        return build([PinnedArchiveRH], preferences)
+
+    ydl.build_request_director = build_pinned
+    ydl._kitty_pinned = True
+    if "_request_director" in getattr(ydl, "__dict__", {}):
+        ydl._request_director.close()
+        del ydl._request_director
+
+
+def _requested_filename(canonical: str) -> str | None:
+    """File path after the item id, when the link names one file."""
+    segments = [unquote(segment) for segment in urlsplit(canonical).path.split("/") if segment]
+    if len(segments) < 3:
+        return None
+    return "/".join(segments[2:])
+
+
+def _entry_names(entry: dict) -> set[str]:
+    names: set[str] = set()
+    for key in ("id", "display_id", "title"):
+        value = entry.get(key)
+        if isinstance(value, str) and value:
+            names.add(value)
+            names.add(value.rsplit("/", 1)[-1])
+    for fmt in entry.get("formats") or []:
+        if not isinstance(fmt, dict):
+            continue
+        raw_url = fmt.get("url")
+        if isinstance(raw_url, str):
+            path = unquote(urlsplit(raw_url).path)
+            names.add(path.rsplit("/", 1)[-1])
+    url = entry.get("url")
+    if isinstance(url, str) and not url.startswith("http"):
+        names.add(url.rsplit("/", 1)[-1])
+    elif isinstance(url, str):
+        names.add(unquote(urlsplit(url).path).rsplit("/", 1)[-1])
+    return {name for name in names if name}
+
+
+def _entry_matches(entry: dict, requested: str) -> bool:
+    requested_name = requested.rsplit("/", 1)[-1]
+    names = _entry_names(entry)
+    folded = {name.casefold() for name in names}
+    return (
+        requested in names
+        or requested_name in names
+        or requested.casefold() in folded
+        or requested_name.casefold() in folded
+    )
+
+
+def _as_video(entry: dict, parent: dict) -> dict:
+    video = dict(entry)
+    video["_type"] = "video"
+    for key in ("extractor", "extractor_key", "webpage_url"):
+        if not video.get(key) and parent.get(key):
+            video[key] = parent[key]
+    return video
+
+
+def select_download(info: dict, requested_file: str | None) -> dict | None:
+    """Keep one video dict from an item page or a named file."""
+    if info.get("_type") not in {"playlist", "multi_video"}:
+        return info
+    entries = [entry for entry in info.get("entries") or [] if isinstance(entry, dict)]
+    if requested_file:
+        matches = [entry for entry in entries if _entry_matches(entry, requested_file)]
+        if len(matches) != 1:
+            exact = [
+                entry
+                for entry in matches
+                if requested_file in _entry_names(entry)
+                or requested_file.rsplit("/", 1)[-1] in _entry_names(entry)
+            ]
+            if len(exact) == 1:
+                matches = exact
+            else:
+                return None
+        return _as_video(matches[0], info)
+    if not entries:
+        return None
+    return _as_video(entries[0], info)
+
+
+def declared_size(info: dict) -> int | None:
+    for key in ("filesize", "filesize_approx"):
+        value = info.get(key)
+        if isinstance(value, int) and value >= 0:
+            return value
+    return None
+
+
+def _media_files(root: Path) -> set[Path]:
+    if not root.exists():
+        return set()
+    found: set[Path] = set()
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix in _PARTIAL_SUFFIXES or path.name.endswith(".part"):
+            continue
+        found.add(path.resolve())
+    return found
+
+
+def directory_size(root: Path) -> int:
+    if not root.exists():
+        return 0
+    total = 0
+    for path in root.rglob("*"):
+        if path.is_file():
+            total += path.stat().st_size
+    return total
+
+
+def cleanup_partials(root: Path) -> None:
+    if not root.is_dir():
+        return
+    for path in root.rglob("*"):
+        if path.is_file() and (
+            path.suffix in _PARTIAL_SUFFIXES or path.name.endswith(".part")
+        ):
+            path.unlink(missing_ok=True)
+
+
+def _output_directory(output_path: str) -> Path:
+    return Path(output_path).parent
+
+
 def _extractor_is_archive(info: object) -> bool:
     if not isinstance(info, dict):
         return False
@@ -229,7 +373,24 @@ def download_audio(
         report(f"Download failed: {exc}")
         return False
 
+    requested_file = _requested_filename(canonical)
+    output_dir = _output_directory(output_path)
+    running_sizes: dict[str, int] = {}
+    finished = {"ok": False}
+
     def _hook(status: dict) -> None:
+        if isinstance(status, dict) and status.get("status") == "finished":
+            finished["ok"] = True
+        if isinstance(status, dict) and status.get("status") == "downloading":
+            key = status.get("filename") or status.get("tmpfilename") or "current"
+            amount = status.get("downloaded_bytes") or 0
+            if isinstance(key, str) and isinstance(amount, int):
+                running_sizes[key] = amount
+                if amount > MAX_FILE_BYTES or sum(running_sizes.values()) > MAX_TOTAL_BYTES:
+                    raise DownloadError(
+                        "That audio is larger than Kitty's limit "
+                        f"of {MAX_FILE_BYTES} bytes per file and {MAX_TOTAL_BYTES} bytes overall."
+                    )
         if (
             isinstance(status, dict)
             and status.get("status") == "finished"
@@ -248,10 +409,15 @@ def download_audio(
         "quiet": False,
         "allowed_extractors": [ARCHIVE_EXTRACTOR_PATTERN],
         "progress_hooks": [_hook],
+        "max_filesize": MAX_FILE_BYTES,
     }
+    if requested_file is None:
+        # A bare /details/ page is a playlist of every file. Keep one.
+        ydl_opts["playlist_items"] = "1"
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            install_pinned_handler(ydl)
             info = ydl.extract_info(fetch_url, download=False, ie_key=ARCHIVE_EXTRACTOR_KEY)
             if not _extractor_is_archive(info):
                 report(
@@ -259,20 +425,50 @@ def download_audio(
                     "Internet Archive extractor did not accept it."
                 )
                 return False
-            result = ydl.download([fetch_url])
-        if result not in (0, None):
-            report("Download failed: The download did not finish.")
-            return False
+            chosen = select_download(info, requested_file)
+            if chosen is None:
+                report("Download failed: That file isn't in this Internet Archive item.")
+                return False
+            size = declared_size(chosen)
+            if size is not None and size > MAX_FILE_BYTES:
+                report(
+                    "Download failed: That audio is larger than Kitty's limit "
+                    f"of {MAX_FILE_BYTES} bytes per file and {MAX_TOTAL_BYTES} bytes overall."
+                )
+                return False
+            before = directory_size(output_dir)
+            before_files = _media_files(output_dir)
+            ydl.process_info(chosen)
+            added = directory_size(output_dir) - before
+            new_files = _media_files(output_dir) - before_files
+            if added > MAX_TOTAL_BYTES:
+                for path in new_files:
+                    path.unlink(missing_ok=True)
+                cleanup_partials(output_dir)
+                report(
+                    "Download failed: That audio is larger than Kitty's limit "
+                    f"of {MAX_FILE_BYTES} bytes per file and {MAX_TOTAL_BYTES} bytes overall."
+                )
+                return False
+            if not finished["ok"] and not new_files:
+                report("Download failed: The download did not finish.")
+                return False
         report(f"Successfully downloaded: {url}")
         return True
     except DownloadError as exc:
+        cleanup_partials(output_dir)
         error_message = str(exc)
         if "DRM protected" in error_message:
             report(f"Skipping DRM-protected track: {url}")
             return False
         report(f"Download failed: {error_message}")
         return False
+    except RequestError as exc:
+        cleanup_partials(output_dir)
+        report(f"Download failed: {exc}")
+        return False
     except Exception as exc:
+        cleanup_partials(output_dir)
         report(f"Unexpected error: {exc}")
         return False
 

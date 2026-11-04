@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app import collect_audio_files, mime_for, safe_download_name
+from app import collect_audio_files, mime_for, open_saved_audio, safe_download_name
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -11,6 +11,8 @@ def test_ui_uses_server_download_not_yt_dlp_directly():
     assert "st.download_button" in source
     assert 'st.button("Download"' in source
     assert "yt_dlp" not in source
+    assert "read_bytes" not in source
+    assert "open_saved_audio" in source
 
 
 def test_project_checklist_files():
@@ -23,7 +25,11 @@ def test_project_checklist_files():
     requirements = (ROOT / "requirements.txt").read_text(encoding="utf-8").lower()
     assert "streamlit" in requirements
     assert "yt-dlp" in requirements
-    assert "pytest" in requirements
+    assert "<2027" in requirements
+    assert "pytest" not in requirements
+    dev = (ROOT / "requirements-dev.txt").read_text(encoding="utf-8").lower()
+    assert "pytest" in dev
+    assert "requirements-dev.txt" in workflow
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     assert "streamlit community cloud" in readme.lower()
     assert "home screen" in readme.lower()
@@ -40,6 +46,16 @@ def test_mime_keeps_original_type():
     assert mime_for(Path("track.mp3")) == "audio/mpeg"
     assert mime_for(Path("track.flac")) == "audio/flac"
     assert mime_for(Path("track.unknownext")) == "application/octet-stream"
+
+
+def test_save_button_reads_the_file_when_opened(tmp_path):
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"original-bytes")
+    opener = open_saved_audio(song)
+    assert callable(opener)
+    with opener() as handle:
+        assert handle.read() == b"original-bytes"
+    assert song.read_bytes() == b"original-bytes"
 
 
 def test_collect_audio_files_stays_inside_the_temp_dir(tmp_path):

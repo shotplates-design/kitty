@@ -158,18 +158,48 @@ def _unique_name(name: str, used: set[str]) -> str:
         index += 1
 
 
-def _clips_from(paths: list[Path]) -> list[dict[str, object]]:
+def open_saved_audio(path: Path):
+    """Open the file when Save is tapped, instead of reading it into memory."""
+
+    def _open():
+        return path.open("rb")
+
+    return _open
+
+
+def clips_from(paths: list[Path]) -> list[dict[str, object]]:
     used: set[str] = set()
     clips: list[dict[str, object]] = []
     for path in paths:
         clips.append(
             {
                 "name": _unique_name(safe_download_name(str(path)), used),
-                "data": path.read_bytes(),
+                "path": path,
                 "mime": mime_for(path),
             }
         )
     return clips
+
+
+def _session_dir() -> Path:
+    stored = st.session_state.get("kitty_dir")
+    if stored:
+        directory = Path(stored)
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+    directory = Path(tempfile.mkdtemp(prefix="kitty-"))
+    st.session_state.kitty_dir = str(directory)
+    return directory
+
+
+def _clear_session_files(directory: Path) -> None:
+    if not directory.is_dir():
+        return
+    for path in directory.iterdir():
+        if path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def main() -> None:
@@ -227,33 +257,31 @@ def main() -> None:
                 bar.progress(1.0)
                 status.info("Preparing the original file…")
 
-        temporary = Path(tempfile.mkdtemp(prefix="kitty-"))
-        try:
-            ok = download_audio(
-                url,
-                str(temporary / "%(title)s.%(ext)s"),
-                progress_callback=on_progress,
-                status_callback=notes.append,
-                saved_paths=saved,
-            )
-            message = notes[-1] if notes else "Download failed."
-            clips = None
-            if ok:
-                files = collect_audio_files(temporary, saved)
-                if not files:
-                    ok = False
-                    message = (
-                        "Download failed: Kitty finished, but no audio file was saved."
-                    )
-                else:
-                    clips = _clips_from(files)
-                    if progress["bar"] is None:
-                        progress_slot.progress(1.0)
-            st.session_state.banner = {"ok": ok, "text": message}
-            st.session_state.clips = clips
-        finally:
-            shutil.rmtree(temporary, ignore_errors=True)
-            status.empty()
+        directory = _session_dir()
+        _clear_session_files(directory)
+        ok = download_audio(
+            url,
+            str(directory / "%(title)s.%(ext)s"),
+            progress_callback=on_progress,
+            status_callback=notes.append,
+            saved_paths=saved,
+        )
+        message = notes[-1] if notes else "Download failed."
+        clips = None
+        if ok:
+            files = collect_audio_files(directory, saved)
+            if not files:
+                ok = False
+                message = (
+                    "Download failed: Kitty finished, but no audio file was saved."
+                )
+            else:
+                clips = clips_from(files)
+                if progress["bar"] is None:
+                    progress_slot.progress(1.0)
+        st.session_state.banner = {"ok": ok, "text": message}
+        st.session_state.clips = clips
+        status.empty()
 
     banner = st.session_state.banner
     if banner:
@@ -271,7 +299,7 @@ def main() -> None:
         clip = next(item for item in clips if item["name"] == selected)
         st.download_button(
             "Save audio",
-            data=clip["data"],
+            data=open_saved_audio(Path(clip["path"])),
             file_name=str(clip["name"]),
             mime=str(clip["mime"]),
             type="primary",
